@@ -1,0 +1,132 @@
+import type { SearchJobData } from "@/lib/jobs/queue";
+import { createMediaJob, logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
+import { enqueueDownload } from "@/lib/jobs/queue";
+import { getServerSupabase } from "@/lib/supabase/server";
+import { extractEntities, buildSearchQueries } from "@/lib/ai/gemini";
+import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
+import { getEnv } from "@/lib/env";
+
+export async function processSearchJob(data: SearchJobData): Promise<void> {
+  const env = getEnv();
+  const sb = getServerSupabase();
+  const { projectId, mediaJobId } = data;
+
+  await setMediaJob(mediaJobId, { status: "running", progress: 5 });
+  await setProjectStatus(projectId, "extracting");
+
+  const { data: project, error: projErr } = await sb
+    .from("projects").select("id, transcript").eq("id", projectId).single();
+  if (projErr || !project) throw new Error(`project not found: ${projErr?.message}`);
+  if (!project.transcript || !project.transcript.trim()) {
+    throw new Error("transcript is empty");
+  }
+
+  // 1) Entity extraction
+  await logJob({ projectId, jobId: mediaJobId }, "search.extract.start");
+  const entities = await extractEntities(project.transcript);
+  await logJob({ projectId, jobId: mediaJobId }, "search.extract.done", { count: entities.length });
+  await setMediaJob(mediaJobId, { progress: 25 });
+
+  if (entities.length) {
+    const rows = entities.map((e) => ({
+      project_id: projectId,
+      type: e.type,
+      value: e.value,
+      confidence: e.confidence,
+      metadata: e.metadata,
+    }));
+    const { error } = await sb.from("project_entities").insert(rows);
+    if (error) throw new Error(`save entities: ${error.message}`);
+  }
+
+  // 2) Build queries
+  const queries = buildSearchQueries(entities);
+  if (queries.length === 0) {
+    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { note: "no queries" } });
+    await setProjectStatus(projectId, "ready_for_review");
+    return;
+  }
+
+  // 3) Search YouTube
+  await setProjectStatus(projectId, "searching");
+  const { approved, blocked } = await loadChannelRules();
+  const mainCelebrity = entities.find((e) => e.type === "celebrity")?.value;
+  const keywords = entities
+    .filter((e) => ["movie", "tv_show", "song", "event", "place"].includes(e.type as string))
+    .map((e) => e.value);
+
+  const allCandidates = new Map<string, ReturnType<typeof rankCandidate>>();
+  for (let i = 0; i < queries.length; i++) {
+    const q = queries[i];
+    try {
+      const cands = await searchYoutube({ query: q });
+      for (const c of cands) {
+        const ranked = rankCandidate({
+          candidate: c, mainCelebrity, keywords,
+          approvedChannelIds: approved, blockedChannelIds: blocked,
+        });
+        const prev = allCandidates.get(c.videoId);
+        if (!prev || ranked.score > prev.score) allCandidates.set(c.videoId, ranked);
+      }
+    } catch (e) {
+      await logJob({ projectId, jobId: mediaJobId }, "search.query.failed", { q, err: (e as Error).message });
+    }
+    await setMediaJob(mediaJobId, {
+      progress: 25 + Math.floor(((i + 1) / queries.length) * 35),
+    });
+  }
+
+  // 4) Persist all candidates (rejected too — useful for debugging in UI)
+  const candidateRows = Array.from(allCandidates.values()).map((c) => ({
+    project_id: projectId,
+    youtube_video_id: c.videoId,
+    url: c.url,
+    title: c.title,
+    description: c.description.slice(0, 4000),
+    channel_id: c.channelId,
+    channel_title: c.channelTitle,
+    duration_seconds: c.durationSeconds,
+    score: c.score,
+    status: c.rejected ? "rejected" : "candidate",
+    metadata: { reasons: c.reasons, rejectReason: c.rejectReason ?? null, isLive: c.isLive, privacyStatus: c.privacyStatus },
+  }));
+  if (candidateRows.length) {
+    const { error } = await sb.from("youtube_search_results").insert(candidateRows);
+    if (error) throw new Error(`save candidates: ${error.message}`);
+  }
+
+  // 5) Pick top N
+  const accepted = Array.from(allCandidates.values())
+    .filter((c) => !c.rejected)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, env.MAX_VIDEOS_PER_PROJECT);
+
+  if (accepted.length === 0) {
+    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { note: "no accepted candidates" } });
+    await setProjectStatus(projectId, "failed");
+    throw new Error("No usable YouTube candidates found");
+  }
+
+  // 6) Mark accepted in DB and enqueue downloads (one media_job + bull job per video)
+  await setProjectStatus(projectId, "downloading");
+  for (const a of accepted) {
+    const { error: updErr } = await sb
+      .from("youtube_search_results")
+      .update({ status: "selected" })
+      .eq("project_id", projectId)
+      .eq("youtube_video_id", a.videoId);
+    if (updErr) await logJob({ projectId, jobId: mediaJobId }, "search.mark_selected.failed", { err: updErr.message });
+
+    const childJobId = await createMediaJob({
+      projectId,
+      type: "download",
+      metadata: { youtube_video_id: a.videoId, youtube_url: a.url, title: a.title },
+    });
+    await enqueueDownload({
+      projectId, mediaJobId: childJobId,
+      youtubeVideoId: a.videoId, youtubeUrl: a.url,
+    });
+  }
+
+  await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { accepted: accepted.length } });
+}
