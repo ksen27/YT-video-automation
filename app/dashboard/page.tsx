@@ -1,8 +1,17 @@
-import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { NewProjectForm } from "./new-project-form";
 import Link from "next/link";
+import { FolderClosed, Sparkles } from "lucide-react";
+import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/ui/empty-state";
+import { NewProjectForm } from "./new-project-form";
+import { statusToTone } from "@/app/projects/[id]/_shared";
 
 export const dynamic = "force-dynamic";
 
@@ -26,29 +35,49 @@ async function loadProjects(): Promise<ProjectRow[]> {
   return (data ?? []) as ProjectRow[];
 }
 
-function statusVariant(s: string): "default" | "secondary" | "success" | "warning" | "destructive" {
-  if (s === "completed") return "success";
-  if (s === "failed") return "destructive";
-  if (s === "ready_for_review") return "warning";
-  if (s === "draft") return "secondary";
+function badgeVariantFor(s: string): "default" | "secondary" | "success" | "warning" | "destructive" | "info" | "outline" {
+  const tone = statusToTone(s);
+  if (tone === "success") return "success";
+  if (tone === "warning") return "warning";
+  if (tone === "danger") return "destructive";
+  if (tone === "info") return "info";
+  if (tone === "muted") return "secondary";
   return "default";
 }
 
 export default async function DashboardPage() {
   const projects = await loadProjects();
-  return (
-    <div className="p-8 max-w-7xl mx-auto space-y-8">
-      <header className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
-          <p className="text-sm text-muted-foreground">Create a project, paste a script, and generate a video.</p>
-        </div>
-      </header>
 
+  return (
+    <div className="px-6 lg:px-8 py-8 max-w-7xl mx-auto space-y-10">
+      {/* Hero */}
+      <section className="relative overflow-hidden rounded-[18px] border border-border bg-bg-elevated p-8">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 -z-0"
+          style={{
+            background:
+              "radial-gradient(600px 220px at 80% 0%, rgba(139,92,246,0.18), transparent 60%), radial-gradient(500px 200px at 0% 100%, rgba(99,102,241,0.18), transparent 60%)",
+          }}
+        />
+        <div className="relative max-w-2xl">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-brand-500/10 border border-brand-500/30 px-2.5 h-6 text-[11px] font-medium text-brand-300">
+            <Sparkles className="h-3 w-3" /> AI workflow
+          </span>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight text-fg">
+            Turn a script into a <span className="gradient-text">finished video</span>.
+          </h1>
+          <p className="mt-2 text-sm text-fg-muted">
+            Paste a transcript or upload a voiceover. We analyze, find sources, and assemble it into scenes you can edit.
+          </p>
+        </div>
+      </section>
+
+      {/* New project */}
       <Card>
         <CardHeader>
           <CardTitle>New project</CardTitle>
-          <CardDescription>Start from a script or empty draft.</CardDescription>
+          <CardDescription>Start from a script or upload a voiceover.</CardDescription>
         </CardHeader>
         <CardContent>
           <NewProjectForm />
@@ -56,31 +85,49 @@ export default async function DashboardPage() {
       </Card>
 
       {!isSupabaseConfigured() && (
-        <Card>
+        <Card className="border-danger/40">
           <CardHeader>
-            <CardTitle className="text-destructive">Supabase not configured</CardTitle>
+            <CardTitle className="text-danger">Supabase not configured</CardTitle>
             <CardDescription>
-              Set NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY in .env.local. See <Link className="underline" href="/settings">settings</Link>.
+              Set NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY in <code>.env.local</code>. See{" "}
+              <Link className="underline text-brand-300" href="/settings">
+                settings
+              </Link>
+              .
             </CardDescription>
           </CardHeader>
         </Card>
       )}
 
+      {/* Recent projects */}
       <section>
-        <h2 className="text-sm font-medium text-muted-foreground mb-3">Recent projects</h2>
+        <div className="mb-4 flex items-baseline justify-between">
+          <h2 className="text-sm font-medium text-fg-muted">Recent projects</h2>
+          <span className="text-xs text-fg-subtle tabular-nums">{projects.length} total</span>
+        </div>
         {projects.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No projects yet.</p>
+          <EmptyState
+            icon={<FolderClosed className="h-5 w-5" />}
+            title="No projects yet"
+            description="Start one above — your first video takes about 2 minutes."
+          />
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
-              <Link key={p.id} href={`/projects/${p.id}`} className="block">
-                <Card className="hover:bg-accent/40 transition-colors">
+              <Link key={p.id} href={`/projects/${p.id}`} className="block group">
+                <Card interactive className="h-full">
                   <CardHeader>
-                    <CardTitle className="truncate">{p.title}</CardTitle>
-                    <CardDescription>{new Date(p.created_at).toLocaleString()}</CardDescription>
+                    <CardTitle className="truncate text-fg group-hover:text-brand-300 transition-colors">
+                      {p.title}
+                    </CardTitle>
+                    <CardDescription className="text-xs">
+                      {new Date(p.created_at).toLocaleString()}
+                    </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <Badge variant={statusVariant(p.status)}>{p.status.replace(/_/g, " ")}</Badge>
+                    <Badge variant={badgeVariantFor(p.status)}>
+                      {p.status.replace(/_/g, " ")}
+                    </Badge>
                   </CardContent>
                 </Card>
               </Link>

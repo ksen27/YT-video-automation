@@ -2,11 +2,14 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { uploadBuffer } from "@/lib/storage";
+import { transcribeAudio } from "@/lib/ai/gemini";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
-const MAX_BYTES = 50 * 1024 * 1024; // 50MB cap
+// Cap kept generous since the Gemini Files API path tolerates large files.
+const MAX_BYTES = 500 * 1024 * 1024; // 500MB
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -24,14 +27,26 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const dest = `projects/${id}/voiceover/${Date.now()}.${ext}`;
   const up = await uploadBuffer(buf, dest, file.type || "application/octet-stream");
 
+  // Transcribe with Gemini. If this fails we keep the uploaded audio and
+  // return an error so the user can retry without re-uploading the file.
+  let transcript: string;
+  try {
+    transcript = await transcribeAudio(buf, file.type, file.name);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "transcription failed";
+    return NextResponse.json(
+      { error: `transcription failed: ${message}`, voiceover_url: up.publicUrl },
+      { status: 502 },
+    );
+  }
+
   const sb = getServerSupabase();
   const { data, error } = await sb
     .from("projects")
-    .update({ voiceover_url: up.publicUrl })
+    .update({ voiceover_url: up.publicUrl, transcript })
     .eq("id", id)
     .select("*")
     .single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  // Stub: a future enhancement could enqueue a transcription job here.
-  return NextResponse.json({ project: data, voiceover_url: up.publicUrl });
+  return NextResponse.json({ project: data, voiceover_url: up.publicUrl, transcript });
 }

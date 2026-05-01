@@ -141,6 +141,7 @@ export interface RenderJob {
 }
 
 export type MediaJobType =
+  | "analyze"
   | "search"
   | "download"
   | "clip"

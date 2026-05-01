@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleAIFileManager, FileState } from "@google/generative-ai/server";
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
 
@@ -10,6 +11,61 @@ function getModel() {
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
   const genai = new GoogleGenerativeAI(env.GEMINI_API_KEY);
   return genai.getGenerativeModel({ model: env.GEMINI_MODEL });
+}
+
+function getFileManager(): GoogleAIFileManager {
+  const env = getEnv();
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
+  return new GoogleAIFileManager(env.GEMINI_API_KEY);
+}
+
+// ---------------------------------------------------------------------------
+// Audio transcription
+// ---------------------------------------------------------------------------
+
+// Uploads via the Files API so we don't hit the ~20MB inline-data cap, then
+// asks the model to produce a clean verbatim transcript. The uploaded file is
+// deleted once we're done — Files API entries auto-expire after 48h anyway,
+// but cleaning up keeps the project's file list tidy.
+export async function transcribeAudio(
+  buf: Buffer,
+  mimeType: string,
+  displayName?: string,
+): Promise<string> {
+  const fm = getFileManager();
+  const upload = await fm.uploadFile(buf, { mimeType, displayName });
+  const fileName = upload.file.name;
+  try {
+    // Files API returns immediately with state=PROCESSING for audio. Poll
+    // until ACTIVE before referencing the URI in a generation request.
+    let meta = upload.file;
+    const deadline = Date.now() + 5 * 60_000;
+    while (meta.state === FileState.PROCESSING) {
+      if (Date.now() > deadline) throw new Error("transcription file processing timed out");
+      await new Promise((r) => setTimeout(r, 2000));
+      meta = await fm.getFile(fileName);
+    }
+    if (meta.state !== FileState.ACTIVE) {
+      throw new Error(`transcription file failed: ${meta.error?.message ?? meta.state}`);
+    }
+
+    const model = getModel();
+    const res = await model.generateContent({
+      contents: [{
+        role: "user",
+        parts: [
+          { fileData: { fileUri: meta.uri, mimeType: meta.mimeType } },
+          { text: "Transcribe this audio verbatim. Return only the transcript text — no timestamps, no speaker labels, no commentary, no surrounding quotes." },
+        ],
+      }],
+      generationConfig: { temperature: 0.1 },
+    });
+    const text = res.response.text().trim();
+    if (!text) throw new Error("empty transcript from Gemini");
+    return text;
+  } finally {
+    try { await fm.deleteFile(fileName); } catch { /* best-effort cleanup */ }
+  }
 }
 
 // ---------------------------------------------------------------------------

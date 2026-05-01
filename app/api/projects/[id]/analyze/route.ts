@@ -1,0 +1,243 @@
+import { NextResponse, type NextRequest } from "next/server";
+import { z } from "zod";
+import { getServerSupabase } from "@/lib/supabase/server";
+import { setProjectStatus, createMediaJob, setMediaJob, logJob } from "@/lib/jobs/db";
+import {
+  splitTranscriptIntoSegments,
+  estimateDurationSeconds,
+  analyzeSegment,
+  type SegmentUnderstanding,
+} from "@/lib/ai/segments";
+import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
+
+// Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
+// a YouTube preview search. No FFmpeg, no yt-dlp, no downloads. The user
+// confirms the resulting candidates via /confirm-sources before any heavy work.
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+const UuidSchema = z.string().uuid();
+const PER_INTENT_RESULTS = 6;
+
+export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params;
+  if (!UuidSchema.safeParse(id).success) {
+    return NextResponse.json({ error: "invalid id" }, { status: 400 });
+  }
+  const sb = getServerSupabase();
+  const { data: latest } = await sb
+    .from("media_jobs")
+    .select("id, status, progress, error, metadata, created_at")
+    .eq("project_id", id)
+    .eq("type", "analyze")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!latest) return NextResponse.json({ analyze: null });
+  return NextResponse.json({ analyze: latest });
+}
+
+interface PreviewCandidate {
+  videoId: string;
+  url: string;
+  title: string;
+  channelTitle: string;
+  durationSeconds: number;
+  thumbnailUrl: string;
+  score: number;
+  reasons: string[];
+  rejected: boolean;
+  rejectReason?: string;
+}
+
+interface SegmentAnalysis {
+  index: number;
+  startSeconds: number;
+  endSeconds: number;
+  wordCount: number;
+  textPreview: string;
+  understanding: SegmentUnderstanding;
+  candidates: PreviewCandidate[];
+}
+
+export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params;
+  if (!UuidSchema.safeParse(id).success) {
+    return NextResponse.json({ error: "invalid id" }, { status: 400 });
+  }
+
+  const sb = getServerSupabase();
+  const { data: project, error: projErr } = await sb
+    .from("projects").select("id, transcript, status").eq("id", id).single();
+  if (projErr || !project) return NextResponse.json({ error: "project not found" }, { status: 404 });
+  const transcript = (project.transcript ?? "").trim();
+  if (!transcript) {
+    return NextResponse.json({ error: "transcript required before analysis" }, { status: 400 });
+  }
+
+  // Block if downstream pipeline already running.
+  const { data: openJobs } = await sb
+    .from("media_jobs")
+    .select("id")
+    .eq("project_id", id)
+    .in("type", ["search", "download", "clip", "match", "render"])
+    .in("status", ["queued", "running"])
+    .limit(1);
+  if ((openJobs ?? []).length > 0) {
+    return NextResponse.json({ error: "generation already in progress" }, { status: 409 });
+  }
+
+  // Reset prior preview state — re-running analyze should produce a clean view.
+  await sb.from("youtube_search_results").delete().eq("project_id", id);
+  await sb.from("project_entities").delete().eq("project_id", id);
+
+  const mediaJobId = await createMediaJob({ projectId: id, type: "analyze" });
+  await setMediaJob(mediaJobId, { status: "running", progress: 5 });
+  await setProjectStatus(id, "extracting");
+
+  try {
+    const segments = splitTranscriptIntoSegments(transcript);
+    const totalDurationSeconds = estimateDurationSeconds(transcript);
+    await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segmented", {
+      segments: segments.length, totalDurationSeconds,
+    });
+
+    // 1) Per-segment understanding (parallel — Gemini calls are independent)
+    const understandings = await Promise.all(segments.map((seg) => analyzeSegment(seg)));
+    await setMediaJob(mediaJobId, { progress: 35 });
+
+    // Persist a flat entity list for the existing matchProcessor / workspace UI.
+    const entityRows: Array<{ project_id: string; type: string; value: string; confidence: number; metadata: Record<string, unknown> }> = [];
+    const seenEntity = new Set<string>();
+    function pushEntity(type: string, value: string, segIdx: number) {
+      const key = `${type}:${value.toLowerCase()}`;
+      if (seenEntity.has(key)) return;
+      seenEntity.add(key);
+      entityRows.push({ project_id: id, type, value, confidence: 0.8, metadata: { segment_index: segIdx } });
+    }
+    understandings.forEach((u, segIdx) => {
+      u.people.forEach((v) => pushEntity("related_person", v, segIdx));
+      u.places.forEach((v) => pushEntity("place", v, segIdx));
+      u.events.forEach((v) => pushEntity("event", v, segIdx));
+      u.topics.forEach((v) => pushEntity("topic", v, segIdx));
+    });
+    if (entityRows.length) {
+      const { error } = await sb.from("project_entities").insert(entityRows);
+      if (error) await logJob({ projectId: id, jobId: mediaJobId }, "analyze.entities.save_failed", { err: error.message });
+    }
+
+    // 2) YouTube search per intent. We'll dedupe across the whole project but
+    // still attribute the best score to a single segment for the preview UI.
+    await setProjectStatus(id, "searching");
+    const { approved, blocked } = await loadChannelRules();
+    const allKeywords = Array.from(new Set(understandings.flatMap((u) => u.relatedKeywords)));
+    const mainCelebrity = entityRows.find((e) => e.type === "related_person")?.value;
+
+    const seenVideo = new Set<string>();
+    const segmentAnalyses: SegmentAnalysis[] = [];
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const u = understandings[i];
+      const segCandidates: PreviewCandidate[] = [];
+      for (const intent of u.searchIntents) {
+        let cands: Awaited<ReturnType<typeof searchYoutube>> = [];
+        try {
+          cands = await searchYoutube({ query: intent.query, maxResults: PER_INTENT_RESULTS });
+        } catch (e) {
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.search.failed", {
+            segment: i, query: intent.query, err: (e as Error).message,
+          });
+          continue;
+        }
+        for (const c of cands) {
+          if (seenVideo.has(c.videoId)) continue;
+          const ranked = rankCandidate({
+            candidate: c, mainCelebrity, keywords: allKeywords,
+            approvedChannelIds: approved, blockedChannelIds: blocked,
+          });
+          if (ranked.rejected) continue;     // keep the preview clean
+          seenVideo.add(c.videoId);
+          segCandidates.push({
+            videoId: c.videoId,
+            url: c.url,
+            title: c.title,
+            channelTitle: c.channelTitle,
+            durationSeconds: c.durationSeconds,
+            thumbnailUrl: `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`,
+            score: ranked.score,
+            reasons: ranked.reasons,
+            rejected: false,
+          });
+        }
+      }
+      segCandidates.sort((a, b) => b.score - a.score);
+      segmentAnalyses.push({
+        index: seg.index,
+        startSeconds: seg.startSeconds,
+        endSeconds: seg.endSeconds,
+        wordCount: seg.wordCount,
+        textPreview: seg.text.slice(0, 220),
+        understanding: u,
+        candidates: segCandidates.slice(0, 8),
+      });
+      await setMediaJob(mediaJobId, {
+        progress: 35 + Math.floor(((i + 1) / segments.length) * 55),
+      });
+    }
+
+    // 3) Persist all candidates so the workspace can re-render preview state
+    //    without re-running the Gemini + YouTube spend.
+    const rows = segmentAnalyses.flatMap((s) =>
+      s.candidates.map((c) => ({
+        project_id: id,
+        youtube_video_id: c.videoId,
+        url: c.url,
+        title: c.title,
+        description: null,
+        channel_id: null,
+        channel_title: c.channelTitle,
+        duration_seconds: c.durationSeconds,
+        score: c.score,
+        status: "candidate" as const,
+        metadata: {
+          segment_index: s.index,
+          thumbnail_url: c.thumbnailUrl,
+          reasons: c.reasons,
+        },
+      }))
+    );
+    if (rows.length) {
+      const { error } = await sb.from("youtube_search_results").insert(rows);
+      if (error) {
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.candidates.save_failed", { err: error.message });
+      }
+    }
+
+    const payload = {
+      projectId: id,
+      totalDurationSeconds,
+      wordCount: transcript.split(/\s+/).filter(Boolean).length,
+      segments: segmentAnalyses,
+    };
+
+    await setMediaJob(mediaJobId, {
+      status: "completed", progress: 100,
+      metadata: {
+        segments: segmentAnalyses.length,
+        totalDurationSeconds,
+        candidate_count: rows.length,
+      },
+    });
+    await setProjectStatus(id, "ready_for_review");
+
+    return NextResponse.json(payload);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "analyze failed";
+    await setMediaJob(mediaJobId, { status: "failed", error: message });
+    await setProjectStatus(id, "failed");
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
