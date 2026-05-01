@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { uploadBuffer } from "@/lib/storage";
-import { transcribeAudio } from "@/lib/ai/gemini";
+import { transcribeAudio } from "@/lib/ai/deepgram";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,7 +31,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // return an error so the user can retry without re-uploading the file.
   let transcript: string;
   try {
-    transcript = await transcribeAudio(buf, file.type, file.name);
+    transcript = await transcribeAudio(buf, file.type);
   } catch (err) {
     const message = err instanceof Error ? err.message : "transcription failed";
     return NextResponse.json(

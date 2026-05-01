@@ -9,6 +9,8 @@ const ServerEnvSchema = z.object({
   YOUTUBE_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+  DEEPGRAM_API_KEY: z.string().optional(),
+  DEEPGRAM_MODEL: z.string().default("nova-3"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
   WORKER_CONCURRENCY: z.coerce.number().int().positive().default(2),
   MAX_VIDEOS_PER_PROJECT: z.coerce.number().int().positive().default(5),
