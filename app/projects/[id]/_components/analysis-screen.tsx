@@ -46,6 +46,15 @@ interface SegmentUnderstanding {
   searchIntents: { label: string; query: string }[];
 }
 
+interface SegmentPlan {
+  durationSeconds: number;
+  blockCount: number;
+  footageNeeded: number;
+  imagesNeeded: number;
+  generatedClips: number;
+  requiredClips: number;
+}
+
 interface SegmentAnalysis {
   index: number;
   startSeconds: number;
@@ -54,12 +63,26 @@ interface SegmentAnalysis {
   textPreview: string;
   understanding: SegmentUnderstanding;
   candidates: PreviewCandidate[];
+  plan: SegmentPlan;
+}
+
+interface TimelinePlanSummary {
+  voiceoverSeconds: number;
+  avgBlockSeconds: number;
+  totalBlocks: number;
+  footageBlocks: number;
+  imageBlocks: number;
+  bucket: "short" | "medium" | "long";
+  generatedClips: number;
 }
 
 interface AnalyzeResponse {
   projectId: string;
   totalDurationSeconds: number;
+  voiceoverDurationSeconds: number;
+  estimatedDurationSeconds: number;
   wordCount: number;
+  plan: TimelinePlanSummary;
   segments: SegmentAnalysis[];
 }
 
@@ -209,6 +232,7 @@ export function AnalysisScreen({
             durationSec={totals.durationSec}
             segmentCount={totals.segments}
             selected={totals.selected}
+            plan={data.plan}
           />
 
           <div className="space-y-3">
@@ -295,16 +319,26 @@ function SummaryStrip({
   durationSec,
   segmentCount,
   selected,
+  plan,
 }: {
   durationSec: number;
   segmentCount: number;
   selected: number;
+  plan: TimelinePlanSummary;
 }) {
   return (
-    <div className="grid grid-cols-3 gap-3">
-      <Stat label="Estimated duration" value={fmtMinutes(durationSec)} />
-      <Stat label="Parts" value={String(segmentCount)} />
-      <Stat label="Videos selected" value={String(selected)} highlight={selected > 0} />
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <Stat label="Voiceover duration" value={fmtMinutes(durationSec)} />
+        <Stat label="Parts" value={String(segmentCount)} />
+        <Stat label="Videos selected" value={String(selected)} highlight={selected > 0} />
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Stat label="Avg block" value={`${plan.avgBlockSeconds.toFixed(1)}s`} />
+        <Stat label="Total blocks" value={String(plan.totalBlocks)} />
+        <Stat label="Footage blocks" value={String(plan.footageBlocks)} />
+        <Stat label="Image blocks" value={String(plan.imageBlocks)} />
+      </div>
     </div>
   );
 }
@@ -319,6 +353,22 @@ function Stat({ label, value, highlight }: { label: string; value: string; highl
     >
       <div className="text-xs text-fg-subtle">{label}</div>
       <div className={cn("mt-1 text-xl font-semibold tabular-nums", highlight && "text-brand-300")}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function SegStat({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
+  return (
+    <div
+      className={cn(
+        "rounded-md border bg-surface-2 px-2.5 py-2",
+        warn ? "border-amber-500/40" : "border-border",
+      )}
+    >
+      <div className="text-[10px] uppercase tracking-wider text-fg-subtle">{label}</div>
+      <div className={cn("mt-0.5 text-sm font-semibold tabular-nums", warn && "text-amber-300")}>
         {value}
       </div>
     </div>
@@ -396,6 +446,17 @@ function SegmentPanel({
 
       {open && (
         <div className="border-t border-border">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 px-5 pt-4 pb-1 text-xs">
+            <SegStat label="Segment duration" value={fmtMinutes(segment.plan.durationSeconds)} />
+            <SegStat label="Blocks" value={String(segment.plan.blockCount)} />
+            <SegStat label="Footage needed" value={String(segment.plan.footageNeeded)} />
+            <SegStat label="Images needed" value={String(segment.plan.imagesNeeded)} />
+            <SegStat
+              label="Clips ready"
+              value={`${segment.plan.generatedClips} / ${segment.plan.requiredClips}`}
+              warn={segment.plan.generatedClips < segment.plan.requiredClips}
+            />
+          </div>
           <Tabs defaultValue="understanding">
             <div className="px-5 pt-4">
               <TabsList>

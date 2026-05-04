@@ -4,7 +4,11 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, normalizeClip } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, normalizeClip } from "@/lib/media/ffmpeg";
+import { getEnv } from "@/lib/env";
+
+const VALIDATION_FAILED_MSG =
+  "Timeline duration must match voiceover and use unique clips.";
 
 export async function processRenderJob(data: RenderJobData): Promise<void> {
   const sb = getServerSupabase();
@@ -30,6 +34,15 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     throw new Error("no renderable timeline items");
   }
 
+  // Defense-in-depth: enforce unique clip ids inside the worker too.
+  const renderableClipIds = renderable.map((it) => String(it.clip_id));
+  if (new Set(renderableClipIds).size !== renderableClipIds.length) {
+    await setMediaJob(mediaJobId, { status: "failed", error: VALIDATION_FAILED_MSG });
+    await sb.from("render_jobs").update({ status: "failed", error: VALIDATION_FAILED_MSG }).eq("id", renderJobId);
+    await setProjectStatus(projectId, "failed");
+    throw new Error(VALIDATION_FAILED_MSG);
+  }
+
   const clipIds = renderable.map((it) => it.clip_id as string);
   const { data: clipRows } = await sb.from("video_clips").select("id, clip_url").in("id", clipIds);
   const clipUrlById = new Map<string, string | null>(
@@ -53,17 +66,38 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       await sb.from("render_jobs").update({ progress: 5 + Math.floor(((i + 1) / renderable.length) * 30) }).eq("id", renderJobId);
     }
 
-    // 2) Normalize each clip (same res / fps / codec)
+    // 2) Trim each clip to its planned duration, then normalize.
+    //    Source clips on disk are CLIP_DURATION_SECONDS long but the planner
+    //    asks for varied 4–6s footage holds — re-cut so the final video
+    //    actually matches the timeline length we validated.
     for (let i = 0; i < downloaded.length; i++) {
+      const it = renderable[i];
+      const plannedDur = Math.max(0.5, Number(it.duration) || 0);
+      const trimmed = path.join(tmp, `cut_${String(i).padStart(3, "0")}.mp4`);
+      try {
+        await cutClip({
+          inputPath: downloaded[i],
+          outputPath: trimmed,
+          startSeconds: 0,
+          durationSeconds: plannedDur,
+        });
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.trim.failed", { idx: i, err: (e as Error).message });
+        await setMediaJob(mediaJobId, { progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) });
+        continue;
+      }
+
       const out = path.join(tmp, `norm_${String(i).padStart(3, "0")}.mp4`);
       try {
-        await normalizeClip({ inputPath: downloaded[i], outputPath: out, width: 1280, height: 720, fps: 30 });
+        await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30 });
         normalized.push(out);
       } catch (e) {
         await logJob({ projectId, jobId: mediaJobId },
           "render.normalize.failed", { idx: i, err: (e as Error).message });
         // Skip the bad one — continue rendering the rest
       }
+      await safeUnlink(trimmed);
       await setMediaJob(mediaJobId, { progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) });
       await sb.from("render_jobs").update({ progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) }).eq("id", renderJobId);
     }
@@ -116,9 +150,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
 }
 
 async function downloadHttp(url: string, destPath: string): Promise<void> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`download ${url}: ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  await fs.mkdir(path.dirname(destPath), { recursive: true });
-  await fs.writeFile(destPath, buf);
+  const timeoutMs = getEnv().HTTP_DOWNLOAD_TIMEOUT_SECONDS * 1000;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`download ${url}: ${r.status}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    await fs.mkdir(path.dirname(destPath), { recursive: true });
+    await fs.writeFile(destPath, buf);
+  } catch (e) {
+    if ((e as Error).name === "AbortError") {
+      throw new Error(`download ${url}: timed out after ${timeoutMs / 1000}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }

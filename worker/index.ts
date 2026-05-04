@@ -19,24 +19,39 @@ import { processRenderJob }   from "./processors/renderProcessor";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
+const downloadConcurrency = env.DOWNLOAD_CONCURRENCY;
 
-console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.starting", concurrency }));
+console.log(JSON.stringify({
+  ts: new Date().toISOString(),
+  msg: "worker.starting",
+  concurrency,
+  downloadConcurrency,
+}));
 
 const workers: Worker[] = [];
 
+export interface JobAttemptInfo {
+  attemptsMade: number;     // 1-indexed for the current run
+  attemptsAllowed: number;  // total attempts BullMQ will make
+}
+
 function startWorker<T>(
   name: string,
-  handler: (data: T) => Promise<void>,
+  handler: (data: T, attempt: JobAttemptInfo) => Promise<void>,
   c: number
 ): Worker {
   const w = new Worker<T>(name, async (job) => {
     const t0 = Date.now();
-    console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.start", data: job.data }));
+    const attempt: JobAttemptInfo = {
+      attemptsMade: (job.attemptsMade ?? 0) + 1,
+      attemptsAllowed: job.opts?.attempts ?? 1,
+    };
+    console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.start", attempt, data: job.data }));
     try {
-      await handler(job.data);
+      await handler(job.data, attempt);
       console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.done", ms: Date.now() - t0 }));
     } catch (e) {
-      console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.failed", err: (e as Error).message, ms: Date.now() - t0 }));
+      console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.failed", attempt, err: (e as Error).message, ms: Date.now() - t0 }));
       throw e;
     }
   }, {
@@ -50,7 +65,7 @@ function startWorker<T>(
 }
 
 workers.push(startWorker(QUEUE_NAMES.search,   processSearchJob,   1));
-workers.push(startWorker(QUEUE_NAMES.download, processDownloadJob, Math.max(1, Math.min(concurrency, 2))));
+workers.push(startWorker(QUEUE_NAMES.download, processDownloadJob, downloadConcurrency));
 workers.push(startWorker(QUEUE_NAMES.clip,     processClipJob,     concurrency));
 workers.push(startWorker(QUEUE_NAMES.match,    processMatchJob,    1));
 workers.push(startWorker(QUEUE_NAMES.render,   processRenderJob,   1));

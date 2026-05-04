@@ -20,17 +20,18 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
 
   // -ss before -i is fastest (input-side seek). We re-encode to ensure clean
   // GOP boundaries and consistent codec across clips for the final render.
+  // -an because source downloads are video-only — final voiceover is mixed in
+  // during concat, not from clip audio.
   const args = [
     "-y",
     "-ss", String(opts.startSeconds),
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
+    "-an",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "22",
     "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "128k",
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -77,16 +78,13 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   const args = [
     "-y",
     "-i", opts.inputPath,
+    "-an",
     "-vf",
     `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "22",
     "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-ar", "48000",
-    "-ac", "2",
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -109,8 +107,11 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
   const listPath = `${opts.outputPath}.concat.txt`;
+  // ffmpeg's concat demuxer resolves `file` entries relative to the list
+  // file's directory, so we must write absolute paths here — otherwise a
+  // relative outputPath causes the list dir to be prepended twice.
   const listBody = opts.inputPaths
-    .map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`)
+    .map((p) => `file '${path.resolve(p).replace(/\\/g, "/").replace(/'/g, "'\\''")}'`)
     .join("\n");
   await fs.writeFile(listPath, listBody, "utf8");
 
@@ -122,33 +123,38 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     "-i", listPath,
   ];
 
+  // Concat input is silent video (clips are normalized with -an). Final audio
+  // is always built from external sources only: voiceover + optional bg music.
+  // We never read audio from input 0.
   let audioMap: string[] = [];
-  if (opts.voiceoverPath) {
+  let hasAudioOutput = false;
+  if (opts.voiceoverPath && opts.bgMusicPath) {
     args.push("-i", opts.voiceoverPath);
-    if (opts.bgMusicPath) {
-      args.push("-i", opts.bgMusicPath);
-      // input 0 = video+audio, 1 = voiceover, 2 = bg
-      args.push(
-        "-filter_complex",
-        `[1:a]volume=${opts.voiceoverGain ?? 1.0}[vo];` +
-        `[2:a]volume=${opts.bgMusicGain ?? 0.15}[bg];` +
-        `[vo][bg]amix=inputs=2:duration=longest:dropout_transition=0[aout]`
-      );
-      audioMap = ["-map", "0:v:0", "-map", "[aout]"];
-    } else {
-      audioMap = ["-map", "0:v:0", "-map", "1:a:0"];
-    }
+    args.push("-i", opts.bgMusicPath);
+    // input 0 = silent video, 1 = voiceover, 2 = bg music
+    args.push(
+      "-filter_complex",
+      `[1:a]volume=${opts.voiceoverGain ?? 1.0}[vo];` +
+      `[2:a]volume=${opts.bgMusicGain ?? 0.15}[bg];` +
+      `[vo][bg]amix=inputs=2:duration=longest:dropout_transition=0[aout]`
+    );
+    audioMap = ["-map", "0:v:0", "-map", "[aout]"];
+    hasAudioOutput = true;
+  } else if (opts.voiceoverPath) {
+    args.push("-i", opts.voiceoverPath);
+    audioMap = ["-map", "0:v:0", "-map", "1:a:0"];
+    hasAudioOutput = true;
   } else if (opts.bgMusicPath) {
     args.push("-i", opts.bgMusicPath);
     args.push(
       "-filter_complex",
-      `[0:a]volume=1.0[base];` +
-      `[1:a]volume=${opts.bgMusicGain ?? 0.15}[bg];` +
-      `[base][bg]amix=inputs=2:duration=shortest:dropout_transition=0[aout]`
+      `[1:a]volume=${opts.bgMusicGain ?? 0.15}[bg]`
     );
-    audioMap = ["-map", "0:v:0", "-map", "[aout]"];
+    audioMap = ["-map", "0:v:0", "-map", "[bg]"];
+    hasAudioOutput = true;
   } else {
-    audioMap = ["-map", "0:v:0", "-map", "0:a?"];
+    // No external audio at all — produce a silent video.
+    audioMap = ["-map", "0:v:0"];
   }
 
   args.push(
@@ -157,12 +163,13 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     "-preset", "veryfast",
     "-crf", "22",
     "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "192k",
-    "-shortest",
-    "-movflags", "+faststart",
-    opts.outputPath,
   );
+  if (hasAudioOutput) {
+    args.push("-c:a", "aac", "-b:a", "192k", "-shortest");
+  } else {
+    args.push("-an");
+  }
+  args.push("-movflags", "+faststart", opts.outputPath);
 
   try {
     await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
@@ -176,15 +183,30 @@ function runFFmpeg(
   args: string[],
   signal?: AbortSignal
 ): Promise<void> {
+  const timeoutSeconds = getEnv().FFMPEG_TIMEOUT_SECONDS;
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutSeconds * 1000);
+
     child.stderr.on("data", (c) => { stderr += c.toString(); });
-    child.on("error", reject);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
     child.on("close", (code) => {
-      if (code === 0) resolve();
+      clearTimeout(timer);
+      if (timedOut) reject(new Error(`ffmpeg timed out after ${timeoutSeconds}s`));
+      else if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
     });
-    signal?.addEventListener("abort", () => child.kill("SIGKILL"));
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+    });
   });
 }

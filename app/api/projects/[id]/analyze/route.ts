@@ -8,6 +8,7 @@ import {
   analyzeSegment,
   type SegmentUnderstanding,
 } from "@/lib/ai/segments";
+import { planTimeline } from "@/lib/ai/timeline-plan";
 import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
 
 // Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
@@ -60,6 +61,14 @@ interface SegmentAnalysis {
   textPreview: string;
   understanding: SegmentUnderstanding;
   candidates: PreviewCandidate[];
+  plan: {
+    durationSeconds: number;
+    blockCount: number;
+    footageNeeded: number;
+    imagesNeeded: number;
+    generatedClips: number;     // unique candidates currently selected for preview
+    requiredClips: number;      // == footageNeeded
+  };
 }
 
 export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -70,7 +79,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
 
   const sb = getServerSupabase();
   const { data: project, error: projErr } = await sb
-    .from("projects").select("id, transcript, status").eq("id", id).single();
+    .from("projects").select("id, transcript, status, voiceover_duration_seconds").eq("id", id).single();
   if (projErr || !project) return NextResponse.json({ error: "project not found" }, { status: 404 });
   const transcript = (project.transcript ?? "").trim();
   if (!transcript) {
@@ -99,9 +108,18 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
 
   try {
     const segments = splitTranscriptIntoSegments(transcript);
-    const totalDurationSeconds = estimateDurationSeconds(transcript);
+    const estimatedDurationSeconds = estimateDurationSeconds(transcript);
+    // Prefer the probed voiceover duration; fall back to the word-count
+    // estimate so the UI can still show a plan before any audio is uploaded.
+    const voiceoverDurationSeconds =
+      Number(project.voiceover_duration_seconds) || estimatedDurationSeconds;
+    const totalDurationSeconds = voiceoverDurationSeconds;
+    const plan = planTimeline(voiceoverDurationSeconds);
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segmented", {
-      segments: segments.length, totalDurationSeconds,
+      segments: segments.length,
+      totalDurationSeconds,
+      avgBlockSeconds: plan.avgBlockSeconds,
+      totalBlocks: plan.totalBlocks,
     });
 
     // 1) Per-segment understanding (parallel — Gemini calls are independent)
@@ -174,6 +192,11 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         }
       }
       segCandidates.sort((a, b) => b.score - a.score);
+      const segDuration = Math.max(0, seg.endSeconds - seg.startSeconds);
+      const segBlockCount = Math.max(1, Math.ceil(segDuration / plan.avgBlockSeconds));
+      const segFootageNeeded = Math.ceil(segBlockCount * 0.6);
+      const segImagesNeeded = Math.ceil(segBlockCount * 0.4);
+      const trimmedCandidates = segCandidates.slice(0, 8);
       segmentAnalyses.push({
         index: seg.index,
         startSeconds: seg.startSeconds,
@@ -181,7 +204,15 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         wordCount: seg.wordCount,
         textPreview: seg.text.slice(0, 220),
         understanding: u,
-        candidates: segCandidates.slice(0, 8),
+        candidates: trimmedCandidates,
+        plan: {
+          durationSeconds: segDuration,
+          blockCount: segBlockCount,
+          footageNeeded: segFootageNeeded,
+          imagesNeeded: segImagesNeeded,
+          generatedClips: trimmedCandidates.length,
+          requiredClips: segFootageNeeded,
+        },
       });
       await setMediaJob(mediaJobId, {
         progress: 35 + Math.floor(((i + 1) / segments.length) * 55),
@@ -216,10 +247,25 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       }
     }
 
+    const totalGeneratedClips = segmentAnalyses.reduce(
+      (s, seg) => s + seg.plan.generatedClips,
+      0,
+    );
     const payload = {
       projectId: id,
       totalDurationSeconds,
+      voiceoverDurationSeconds,
+      estimatedDurationSeconds,
       wordCount: transcript.split(/\s+/).filter(Boolean).length,
+      plan: {
+        voiceoverSeconds: plan.voiceoverSeconds,
+        avgBlockSeconds: plan.avgBlockSeconds,
+        totalBlocks: plan.totalBlocks,
+        footageBlocks: plan.footageBlocks,
+        imageBlocks: plan.imageBlocks,
+        bucket: plan.bucket,
+        generatedClips: totalGeneratedClips,
+      },
       segments: segmentAnalyses,
     };
 
@@ -228,6 +274,10 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       metadata: {
         segments: segmentAnalyses.length,
         totalDurationSeconds,
+        avgBlockSeconds: plan.avgBlockSeconds,
+        totalBlocks: plan.totalBlocks,
+        footageBlocks: plan.footageBlocks,
+        imageBlocks: plan.imageBlocks,
         candidate_count: rows.length,
       },
     });

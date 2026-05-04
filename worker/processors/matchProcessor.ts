@@ -2,6 +2,14 @@ import type { MatchJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { matchClipsToSections, type ClipForMatch } from "@/lib/ai/gemini";
+import {
+  buildBlockSequence,
+  planTimeline,
+  pickDuration,
+  sumDurations,
+  type PlannedBlock,
+} from "@/lib/ai/timeline-plan";
+import { estimateDurationSeconds } from "@/lib/ai/segments";
 
 // Splits a transcript into ~sentence/paragraph sections. Cheap MVP heuristic.
 export function splitTranscript(transcript: string): string[] {
@@ -22,8 +30,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
   await setProjectStatus(projectId, "matching");
 
-  const { data: project } = await sb.from("projects").select("transcript").eq("id", projectId).single();
-  const sections = splitTranscript(project?.transcript ?? "");
+  const { data: project } = await sb
+    .from("projects")
+    .select("transcript, voiceover_duration_seconds")
+    .eq("id", projectId)
+    .single();
+  const transcript = project?.transcript ?? "";
+  const sections = splitTranscript(transcript);
+
+  // Voiceover duration drives the whole plan. Prefer the probed audio length;
+  // fall back to a word-count estimate if the audio wasn't probed.
+  const voiceoverSeconds =
+    Number(project?.voiceover_duration_seconds) ||
+    estimateDurationSeconds(transcript) ||
+    0;
+
+  if (voiceoverSeconds <= 0) {
+    await setMediaJob(mediaJobId, {
+      status: "failed",
+      progress: 100,
+      error: "voiceover duration unknown — re-upload the voiceover or paste a transcript",
+    });
+    await setProjectStatus(projectId, "failed");
+    throw new Error("voiceover duration unknown");
+  }
 
   const { data: clipRows } = await sb
     .from("video_clips")
@@ -59,75 +89,144 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   } catch (e) {
     await logJob({ projectId, jobId: mediaJobId }, "match.gemini.failed", { err: (e as Error).message });
   }
-  await setMediaJob(mediaJobId, { progress: 50 });
+  await setMediaJob(mediaJobId, { progress: 40 });
 
-  // Fallback: round-robin clip assignment if Gemini gave us nothing useful
-  if (matches.length < sections.length) {
-    const need = sections.length - matches.length;
-    const used = new Set(matches.map((m) => m.section_index));
-    let cIdx = 0;
-    for (let i = 0; i < sections.length && need > 0; i++) {
-      if (used.has(i)) continue;
-      const clip = clips[cIdx++ % clips.length];
-      matches.push({ section_index: i, clip_id: clip?.id ?? null });
-    }
-  }
+  // Build a plan + block sequence sized to the voiceover.
+  const plan = planTimeline(voiceoverSeconds);
+  const blocks = buildBlockSequence(plan);
 
-  // Wipe old draft for this project (so re-runs work)
-  await sb.from("timeline_items").delete().eq("project_id", projectId);
-
-  // Build timeline
-  const items: Array<Record<string, unknown>> = [];
-  let position = 0;
-  // Intro item — use first clip if available, 5–6s
-  const introClip = clips[0];
-  items.push({
-    project_id: projectId,
-    clip_id: introClip?.id ?? null,
-    type: "intro",
-    position: position++,
-    duration: 6,
-    script_text: sections[0] ?? null,
-    overlay_text: null,
-    metadata: {},
-    approved: false,
+  await logJob({ projectId, jobId: mediaJobId }, "match.plan", {
+    voiceoverSeconds,
+    avgBlockSeconds: plan.avgBlockSeconds,
+    totalBlocks: plan.totalBlocks,
+    footageBlocks: plan.footageBlocks,
+    imageBlocks: plan.imageBlocks,
+    bucket: plan.bucket,
+    plannedDurationSum: Math.round(sumDurations(blocks) * 10) / 10,
   });
 
-  // Body — alternate footage / image placeholder roughly 60/40
-  for (let i = 0; i < sections.length; i++) {
-    const m = matches.find((mm) => mm.section_index === i);
-    const clipId = m?.clip_id ?? null;
-    const useImage = !clipId || (i % 5 === 4); // every 5th = image placeholder
-    items.push({
-      project_id: projectId,
-      clip_id: useImage ? null : clipId,
-      type: useImage ? "image" : "footage",
-      position: position++,
-      duration: 5,
-      script_text: sections[i] ?? null,
-      overlay_text: null,
-      metadata: useImage ? { placeholder: true } : {},
-      approved: false,
-    });
+  // ---- Clip assignment (each clip used at most once) ---------------------
+  // Order Gemini's matches by section index so earlier sections (where the
+  // first clip choice tends to be the strongest) get priority.
+  const matchOrder = [...matches]
+    .filter((m) => !!m.clip_id)
+    .sort((a, b) => a.section_index - b.section_index)
+    .map((m) => m.clip_id as string);
 
-    // Sprinkle in a split_2 every 6 sections, split_4 every 10 sections
-    if (i > 0 && i % 6 === 0) {
-      items.push({
-        project_id: projectId, clip_id: null, type: "split_2",
-        position: position++, duration: 4, script_text: null, overlay_text: null,
-        metadata: { placeholder: true }, approved: false,
-      });
-    }
-    if (i > 0 && i % 10 === 0) {
-      items.push({
-        project_id: projectId, clip_id: null, type: "split_4",
-        position: position++, duration: 4, script_text: null, overlay_text: null,
-        metadata: { placeholder: true }, approved: false,
-      });
+  // Followed by any clips Gemini didn't reference — keeps us from running
+  // out when the model returns fewer matches than blocks.
+  const unmatchedClipIds = clips
+    .map((c) => c.id as string)
+    .filter((id) => !matchOrder.includes(id));
+
+  const clipQueue: string[] = [...new Set([...matchOrder, ...unmatchedClipIds])];
+  const usedClipIds = new Set<string>();
+
+  // If there are far fewer clips than footage slots, downgrade the surplus
+  // footage blocks to image blocks (with longer durations) — per spec, prefer
+  // more image blocks over duplicating clips.
+  const footageBlockIdxs: number[] = blocks
+    .map((b, i) => (b.type === "footage" || b.type === "intro" ? i : -1))
+    .filter((i) => i >= 0);
+  const surplus = footageBlockIdxs.length - clipQueue.length;
+  if (surplus > 0) {
+    // Convert the LAST `surplus` footage blocks into image blocks. We leave
+    // the intro alone so the video still opens with motion when possible.
+    const convertibles = footageBlockIdxs.filter((i) => blocks[i].type !== "intro");
+    const toConvert = convertibles.slice(-surplus);
+    for (const idx of toConvert) {
+      const newDur = pickDuration("image");
+      blocks[idx] = { type: "image", duration: newDur };
     }
   }
 
-  // Lower-third overlays for the first few celebrity / year / place entities
+  // Wipe old draft for this project (so re-runs work).
+  await sb.from("timeline_items").delete().eq("project_id", projectId);
+
+  // ---- Build timeline_items rows ----------------------------------------
+  const items: Array<Record<string, unknown>> = [];
+  let position = 0;
+  let sectionCursor = 0;
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block: PlannedBlock = blocks[i];
+
+    if (block.type === "intro") {
+      const introClipId = clipQueue.shift();
+      if (introClipId) usedClipIds.add(introClipId);
+      items.push({
+        project_id: projectId,
+        clip_id: introClipId ?? null,
+        type: "intro",
+        position: position++,
+        duration: block.duration,
+        script_text: sections[0] ?? null,
+        overlay_text: null,
+        metadata: { planned: true },
+        approved: false,
+      });
+      continue;
+    }
+
+    if (block.type === "footage") {
+      // Pull the next unused clip from the queue.
+      let clipId: string | null = null;
+      while (clipQueue.length) {
+        const candidate = clipQueue.shift()!;
+        if (!usedClipIds.has(candidate)) {
+          clipId = candidate;
+          usedClipIds.add(candidate);
+          break;
+        }
+      }
+      if (!clipId) {
+        // Ran out — degrade to an image placeholder rather than duplicating.
+        items.push({
+          project_id: projectId,
+          clip_id: null,
+          type: "image",
+          position: position++,
+          duration: pickDuration("image"),
+          script_text: sections[sectionCursor] ?? null,
+          overlay_text: null,
+          metadata: { placeholder: true, planned: true, downgraded_from: "footage" },
+          approved: false,
+        });
+      } else {
+        items.push({
+          project_id: projectId,
+          clip_id: clipId,
+          type: "footage",
+          position: position++,
+          duration: block.duration,
+          script_text: sections[sectionCursor] ?? null,
+          overlay_text: null,
+          metadata: { planned: true },
+          approved: false,
+        });
+      }
+      sectionCursor = Math.min(sections.length - 1, sectionCursor + 1);
+      continue;
+    }
+
+    // Image / split blocks — placeholders, no clip.
+    items.push({
+      project_id: projectId,
+      clip_id: null,
+      type: block.type,
+      position: position++,
+      duration: block.duration,
+      script_text: sections[sectionCursor] ?? null,
+      overlay_text: null,
+      metadata: { placeholder: true, planned: true },
+      approved: false,
+    });
+    sectionCursor = Math.min(sections.length - 1, sectionCursor + 1);
+  }
+
+  // Lower-third overlays for the first few celebrity / year / place entities.
+  // These don't consume timeline duration in the renderer (they're overlays),
+  // so we keep them outside the planned-block sum.
   const { data: ents } = await sb.from("project_entities")
     .select("type, value").eq("project_id", projectId)
     .in("type", ["celebrity", "year", "place"]).limit(6);
@@ -137,22 +236,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       position: position++, duration: 3,
       script_text: null,
       overlay_text: `${e.value}`,
-      metadata: { entity_type: e.type },
+      metadata: { entity_type: e.type, overlay: true },
       approved: false,
     });
   }
-
-  // Final transition
-  items.push({
-    project_id: projectId, clip_id: null, type: "transition",
-    position: position++, duration: 1,
-    script_text: null, overlay_text: null, metadata: {}, approved: false,
-  });
 
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
 
-  await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { items: items.length } });
+  const plannedSum = Math.round(sumDurations(blocks) * 10) / 10;
+  await setMediaJob(mediaJobId, {
+    status: "completed",
+    progress: 100,
+    metadata: {
+      items: items.length,
+      voiceoverSeconds,
+      avgBlockSeconds: plan.avgBlockSeconds,
+      totalBlocks: plan.totalBlocks,
+      footageBlocks: plan.footageBlocks,
+      imageBlocks: plan.imageBlocks,
+      bucket: plan.bucket,
+      plannedDurationSum: plannedSum,
+      uniqueClipsUsed: usedClipIds.size,
+    },
+  });
   await setProjectStatus(projectId, "ready_for_review");
 }

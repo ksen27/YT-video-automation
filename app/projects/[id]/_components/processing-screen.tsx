@@ -22,7 +22,14 @@ export function ProcessingScreen({
 }) {
   const mediaJobs = jobs?.media_jobs ?? [];
   const failedCount = mediaJobs.filter((j) => j.status === "failed").length;
-  const allDone = mediaJobs.length > 0 && mediaJobs.every((j) => j.status === "completed");
+  // "All done" means every pipeline step has settled (done or failed) AND the
+  // match step has actually run — without match, the timeline is empty and the
+  // workspace will never advance to the editor, so showing "complete" here
+  // would lie. Steps with no jobs at all also block "complete".
+  const allDone = PIPELINE_STEPS.every((step) => {
+    const state = stateForStep(step.type, mediaJobs);
+    return state === "done";
+  });
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -107,9 +114,10 @@ function stateForStep(
   const running = list.filter((j) => j.status === "running" || j.status === "queued").length;
   const done = list.filter((j) => j.status === "completed").length;
   if (running > 0) return "running";
-  if (failed > 0 && done === 0) return "failed";
-  if (done === list.length) return "done";
-  if (failed > 0) return "running"; // partial success, treat as still working
+  // Settle once nothing is in-flight. Partial success counts as "done" so the
+  // pipeline can move on — otherwise a single permanent failure (e.g. a
+  // geo-blocked video with no fallback left) would loop forever.
+  if (done + failed === list.length) return done === 0 ? "failed" : "done";
   return "pending";
 }
 

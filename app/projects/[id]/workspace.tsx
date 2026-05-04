@@ -101,7 +101,14 @@ export function ProjectWorkspace({
         <AnalysisScreen projectId={projectId} autoStart={autoAnalyze} />
       )}
       {phase === "processing" && (
-        <ProcessingScreen projectId={projectId} jobs={jobs} />
+        <ProcessingScreen
+          projectId={projectId}
+          jobs={jobs}
+          onRetry={async () => {
+            await fetch(`/api/projects/${projectId}/retry-failed`, { method: "POST" });
+            jobsQ.refetch();
+          }}
+        />
       )}
       {phase === "editor" && (
         <BlockEditorScreen

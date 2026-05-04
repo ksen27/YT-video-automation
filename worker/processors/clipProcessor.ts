@@ -1,8 +1,8 @@
 import path from "node:path";
 import type { ClipJobData } from "@/lib/jobs/queue";
-import { createMediaJob, logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
-import { enqueueMatch } from "@/lib/jobs/queue";
+import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { maybeEnqueueMatch } from "./_shared";
 import { cutClip, generateThumbnail } from "@/lib/media/ffmpeg";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { CLIP_DURATION_SECONDS, MAX_TOTAL_CLIPS_PER_PROJECT, getEnv } from "@/lib/env";
@@ -114,27 +114,3 @@ export function pickClipTimestamps(duration: number, count: number): number[] {
   return out;
 }
 
-// Once *all* of this project's video_sources are either clipped or failed and
-// no download/clip media_jobs are still running/queued, enqueue the match step.
-async function maybeEnqueueMatch(projectId: string): Promise<void> {
-  const sb = getServerSupabase();
-
-  const { data: sources } = await sb.from("video_sources")
-    .select("id, status").eq("project_id", projectId);
-  const stillBusy = (sources ?? []).some((s) => s.status === "downloading" || s.status === "queued" || s.status === "downloaded");
-  if (stillBusy) return;
-
-  const { data: openJobs } = await sb.from("media_jobs")
-    .select("id, type, status").eq("project_id", projectId)
-    .in("status", ["queued", "running"])
-    .in("type", ["download", "clip"]);
-  if ((openJobs ?? []).length > 0) return;
-
-  // Has a match job already been started? Don't double-enqueue.
-  const { data: matchJobs } = await sb.from("media_jobs")
-    .select("id, status").eq("project_id", projectId).eq("type", "match");
-  if ((matchJobs ?? []).some((j) => j.status === "queued" || j.status === "running" || j.status === "completed")) return;
-
-  const id = await createMediaJob({ projectId, type: "match" });
-  await enqueueMatch({ projectId, mediaJobId: id });
-}
